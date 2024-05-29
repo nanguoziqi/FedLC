@@ -530,3 +530,698 @@ def evalutate_model(
 
 
 
+def get_fedavg_argparser() -> ArgumentParser:
+    #创建解析器
+    parser = ArgumentParser()
+    parser.add_argument(
+        "-m", "--model", type=str, default="lenet5", choices=MODELS.keys()
+    )
+    parser.add_argument(
+        "-d", "--dataset", type=str, choices=DATASETS.keys(), default="cifar10"
+    )
+    parser.add_argument("--seed", type=int, default=42)#用于运行实验的随机种子
+    parser.add_argument("-jr", "--join_ratio", type=float, default=0.1)#（每轮客户数）/（总客户数）的比率。
+    parser.add_argument("-ge", "--global_epoch", type=int, default=100)
+    parser.add_argument("-le", "--local_epoch", type=int, default=5)
+    parser.add_argument("-tg", "--test_gap", type=int, default=1)#对客户端执行测试的间隔回合。
+    parser.add_argument("--eval_test", type=int, default=1)#在本地训练前后对加入的客户的测试集执行评估的非零值。
+    parser.add_argument("--eval_val", type=int, default=0)
+    parser.add_argument("--eval_train", type=int, default=0)
+    parser.add_argument(
+        "-op", "--optimizer", type=str, default="sgd", choices=["sgd", "adam"]
+    )#客户端优化器
+    parser.add_argument("-lr", "--local_lr", type=float, default=1e-2)#学习率
+    parser.add_argument("-mom", "--momentum", type=float, default=0.0)#优化器动量
+    parser.add_argument("-wd", "--weight_decay", type=float, default=0.0)#权重衰减
+    parser.add_argument("-bs", "--batch_size", type=int, default=32)#用于客户端本地培训的数据批量大小。
+    parser.add_argument("--external_model_params_file", type=str, default="")#外部模型参数的相对文件路径#####
+    parser.add_argument("--use_cuda", type=int, default=1)#是否使用cuda
+    parser.add_argument("--save_log", type=int, default=0)#保存算法运行日志
+    parser.add_argument("--save_model", type=int, default=0)#保存模型参数
+    parser.add_argument("--save_fig", type=int, default=1)#保存精度曲线
+    parser.add_argument("--save_metrics", type=int, default=1)#保存度量统计信息
+    return parser
+
+
+
+
+class FedAvgServer:
+    def __init__(
+        self,
+        algo: str = "FedAvg",
+        args: Namespace = None,
+        default_trainer=True,
+    ):
+        self.args = get_fedavg_argparser().parse_args() if args is None else args
+        self.algo = algo
+
+        #固定随机种子
+        fix_random_seed(self.args.seed)
+        #获取当前的时间，并格式化为"年-月-日-时:分:秒"的形式
+        begin_time = str(
+            time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime(round(time.time())))
+        )
+        #创建输出目录
+        self.output_dir = OUT_DIR / self.algo / begin_time
+        
+        #读取数据集信息
+        with open(PROJECT_DIR / "data" / self.args.dataset / "args.json", "r") as f:
+            self.args.dataset_args = json.load(f)
+
+        #获取客户端信息
+        try:
+            partition_path = PROJECT_DIR / "data" / self.args.dataset / "partition.pkl"
+            with open(partition_path, "rb") as f:
+                partition = pickle.load(f)
+        except:
+            raise FileNotFoundError(f"Please partition {args.dataset} first.")
+        
+        self.train_clients: List[int] = partition["separation"]["train"]
+        self.test_clients: List[int] = partition["separation"]["test"]
+        self.val_clients: List[int] = partition["separation"]["val"]
+        self.client_num: int = partition["separation"]["total"]
+
+        #是否使用gpu，若使用gpu则选择最佳的gpu
+        self.device = get_optimal_cuda_device(self.args.use_cuda)
+
+        #将根据模型的名称返回一个类，
+        #然后通过指示数据集并调用类来初始化模型对象。
+        #最后将模型对象传输到目标设备。
+        self.model: DecoupledModel = MODELS[self.args.model](
+            dataset=self.args.dataset
+        ).to(self.device)
+        #调用模型的 check_avaliability() 方法来检查模型的可用性
+        self.model.check_avaliability()
+
+        #global_params_dict用于输出单个全局模型的传统FL，有序字典（OrderedDict）
+        self.global_params_dict: OrderedDict[str, torch.Tensor] = None
+
+        #trainable_params 用于从模型中提取可训练的参数。这个函数可能返回两个值：一个是可训练参数的张量列表，另一个是对应参数名称的列表。
+        #函数中的 detach=True 参数意味着提取的参数不会被计算图所连接， requires_name=True 表示需要返回参数的名称。
+        random_init_params, self.trainable_params_name = trainable_params(
+            self.model, detach=True, requires_name=True
+        )
+        #OrderedDict是一个有序的字典类，它保持了元素被插入时的顺序。当遍历这个字典时，将按照参数名称在self.trainable_params_name列表中出现的顺序来访问它们。
+        self.global_params_dict = OrderedDict(
+            #zip函数将两个列表self.trainable_params_name和random_init_params组合成一个迭代器
+            zip(self.trainable_params_name, random_init_params)
+        )
+        if (
+            #预训练文件路径
+            self.args.external_model_params_file
+            and os.path.isfile(self.args.external_model_params_file)
+        ):
+            # 加载预训练参数
+            self.global_params_dict = torch.load(
+                self.args.external_model_params_file, map_location=self.device
+            )
+
+        #创建本地训练epoch列表
+        self.clients_local_epoch: List[int] = [self.args.local_epoch] * self.client_num
+
+        #确保所有算法都通过相同的客户端采样流运行。
+        #如果采样发生在每一轮FL的开始，一些算法在客户端的隐式操作可能会干扰流。
+        #每个全局epoch，随机选取客户端
+        self.client_sample_stream = [
+            random.sample(
+                self.train_clients, max(1, int(self.client_num * self.args.join_ratio))
+            )
+            for _ in range(self.args.global_epoch)
+        ]
+        self.selected_clients: List[int] = []
+        self.current_epoch = 0
+        
+        #用于在测试时控制某些特定方法的行为（并非所有方法都使用）
+        self.test_flag = False
+
+        ##用于日志记录的变量##
+        #如果目录不存在，且需要保存日志、图表或指标，则创建目录
+        if not os.path.isdir(self.output_dir) and (
+            self.args.save_log or self.args.save_fig or self.args.save_metrics
+        ):
+            os.makedirs(self.output_dir, exist_ok=True)
+
+        stdout = Console(log_path=False, log_time=False)
+        self.logger = Logger(
+            stdout=stdout,
+            enable_log=self.args.save_log,
+            logfile_path=OUT_DIR
+            / self.algo
+            / self.output_dir
+            / f"{self.args.dataset}_log.html",
+        )
+        self.test_results: Dict[int, Dict[str, Dict[str, Metrics]]] = {}
+        #创建进度条
+        self.train_progress_bar = track(
+            #stdout 是 Python 的标准库 sys 中的一个对象，表示标准输出
+            range(self.args.global_epoch), "[bold green]Training...", console=stdout
+        )
+
+        #用于在日志中记录实验的开始，包括实验使用的算法和所有相关的参数
+        self.logger.log("=" * 20, self.algo, "=" * 20)
+        self.logger.log("Experiment Arguments:", dict(self.args._get_kwargs()))
+        
+        # init trainer
+        self.trainer = None
+        if default_trainer:
+            self.trainer = FedAvgClient(
+                deepcopy(self.model), self.args, self.logger, self.device
+            )
+
+    #全面的FL流程。
+    def run(self):
+        #提醒指定trainer
+        begin = time.time()
+        if self.trainer is None:
+            raise RuntimeError(
+                "Specify your unique trainer or set `default_trainer` as True."
+            )
+        
+        self.train()
+        end = time.time()
+        total = end - begin
+        self.logger.log(
+            f"{self.algo}'s total running time: {int(total // 3600)} h {int((total % 3600) // 60)} m {int(total % 60)} s."
+        )
+        self.log_max_metrics()
+        self.logger.close()       
+        
+        #保存模型
+        if self.args.save_model:
+            model_name = (
+                f"{self.args.dataset}_{self.args.global_epoch}_{self.args.model}.pt"
+            )
+            torch.save(self.global_params_dict, self.output_dir / model_name)
+        
+    def train(self):
+        avg_round_time = 0
+        #全局训练的epoch
+        for E in self.train_progress_bar:
+            self.current_epoch = E
+
+            #每test_gap轮测试一次##########################
+            if (E + 1) % self.args.test_gap == 0:
+                self.test()
+
+            #被选取的客户端编号
+            self.selected_clients = self.client_sample_stream[E]
+            begin = time.time()
+            self.train_one_round()
+            end = time.time()
+            #self.log_info()
+            avg_round_time = (avg_round_time * (self.current_epoch) + (end - begin)) / (
+                self.current_epoch + 1
+            )
+
+        self.logger.log(
+            f"{self.algo}'s average time taken by each global epoch: {int(avg_round_time // 60)} m {(avg_round_time % 60):.2f} s."
+        )
+
+    #测试FL方法输出的功能。
+    def test(self):
+        self.test_flag = True
+        client_ids = set(self.val_clients + self.test_clients)
+        all_same = False
+        if client_ids:
+            if self.val_clients == self.train_clients == self.test_clients:
+                all_same = True
+                results = {
+                    "all_clients": {
+                            "train": Metrics(),
+                            "val": Metrics(),
+                            "test": Metrics(),
+                    }
+                }
+            else:
+                results = {
+                    "val_clients": {
+                            "train": Metrics(),
+                            "val": Metrics(),
+                            "test": Metrics(),
+                    },
+                    "test_clients": {
+                            "train": Metrics(),
+                            "val": Metrics(),
+                            "test": Metrics(),
+                    },
+                }
+            #对被选中的客户端进行测试
+            for cid in client_ids:
+                client_local_params = self.generate_client_params(cid)
+                client_metrics = self.trainer.test(cid, client_local_params)
+
+                #将测试结果加入results
+                for split in ["train", "val", "test"]:
+                    if all_same:
+                        results["all_clients"][split].update(
+                            client_metrics[split]
+                        )
+                    else:
+                        if cid in self.val_clients:
+                            results["val_clients"][split].update(
+                                client_metrics[split]
+                            )
+                        if cid in self.test_clients:
+                            results["test_clients"][split].update(
+                                client_metrics[split]
+                            )
+
+            self.test_results[self.current_epoch + 1] = results
+
+        self.test_flag = False
+
+    def generate_client_params(self, client_id: int) -> OrderedDict[str, torch.Tensor]:
+
+            return self.global_params_dict
+
+    #在每一轮通信中（在服务器端）需要做的具体事情的功能。
+    def train_one_round(self):
+        delta_cache = []
+        weight_cache = []
+        for client_id in self.selected_clients:
+            client_local_params = self.generate_client_params(client_id)
+            (
+                delta,
+                weight,
+            ) = self.trainer.train(
+                client_id=client_id,
+                local_epoch=self.clients_local_epoch[client_id],
+                new_parameters=client_local_params,
+            )
+
+            delta_cache.append(delta)
+            weight_cache.append(weight)
+
+        self.aggregate(delta_cache, weight_cache)
+
+    @torch.no_grad()
+    def aggregate(
+        self,
+        delta_cache: List[OrderedDict[str, torch.Tensor]],
+        weight_cache: List[int],
+        return_diff=True,
+    ):
+        """
+        此函数用于聚合从选定客户端接收的模型参数。聚合方法默认为加权平均。
+        delta_cache（List[List[torc.Tensor]]）：“delta”表示本地训练前后客户端模型参数之间的差异。
+        weight_cache（List[int]）：每个“delta”的权重（默认情况下为客户端数据集大小）。
+        """
+        #归一化
+        weights = torch.tensor(weight_cache, device=self.device) / sum(weight_cache)
+        if return_diff:
+            delta_list = [list(delta.values()) for delta in delta_cache]
+            #根据weights计算每个位置的加权和
+            aggregated_delta = [
+                #torch.stack`将这些元素堆叠成一个形状为`(N,)`的张量，其中`dim=-1`指定了堆叠的维度。
+                #这意味着，如果`diff`包含了`N`个长度为`K`的列表，结果将是一个形状为`(N, K)`的张量。
+                torch.sum(weights * torch.stack(diff, dim=-1), dim=-1)
+                #zip(*delta_list),将delta_list转置
+                for diff in zip(*delta_list)
+            ]
+
+            #对模型的全局参数进行更新
+            for param, diff in zip(self.global_params_dict.values(), aggregated_delta):
+                param.data -= diff
+        else:
+            #使用delta_cache中的增量值和一个权重列表weights来更新self.global_params_dict中的旧参数。
+            #每次更新都是通过将增量值与相应的权重相乘，并沿最后一个维度求和来实现的。通常在模型的训练过程中使用，特别是当使用自定义的优化算法或者特定的参数更新策略时。
+            for old_param, zipped_new_param in zip(
+                self.global_params_dict.values(), zip(*delta_cache)
+            ):
+                old_param.data = (torch.stack(zipped_new_param, dim=-1) * weights).sum(
+                    dim=-1
+                )
+        #如果strict为True（默认值），那么当状态字典中缺少键或有多余的键时，将会抛出一个错误。如果strict为False，那么只会加载匹配的键，并忽略不匹配的键。
+        self.model.load_state_dict(self.global_params_dict, strict=False)
+    
+    #找出最大的acc
+    def log_max_metrics(self):
+        self.logger.log("=" * 20, self.algo, "Max Accuracy", "=" * 20)
+
+        colors = {
+            "before": "blue",
+            "after": "red",
+            "train": "yellow",
+            "val": "green",
+            "test": "cyan",
+        }
+
+        groups = ["val_clients", "test_clients"]
+        if self.train_clients == self.val_clients == self.test_clients:
+            groups = ["all_clients"]
+
+        for group in groups:
+            self.logger.log(f"{group}:")
+            for split, flag in [
+                ("train", self.args.eval_train),
+                ("val", self.args.eval_val),
+                ("test", self.args.eval_test),
+            ]:
+                if flag:
+                    #将self.test_results字典转换成一个新的列表metrics_list，列表中的每个元素都是一个元组，元组的第一个元素是原字典的键，
+                    #第二个元素是从原字典的值（一个嵌套字典）中提取的特定值，这个特定值是通过group、stage和split这三个键来索引得到的
+                    metrics_list = list(
+                        map(
+                            lambda tup: (tup[0], tup[1][group][split]),
+                            self.test_results.items(),
+                        )
+                    )
+                    if len(metrics_list) > 0:
+                        #出metrics_list中准确率（accuracy）最高的元组，并返回这个元组的epoch和accuracy值
+                        epoch, max_acc = max(
+                            [
+                                (epoch, metrics.accuracy)
+                                for epoch, metrics in metrics_list
+                            ],
+                            #当max()函数比较列表中的元素时，它会使用这个lambda函数来确定哪个元素是最大的
+                            key=lambda tup: tup[1],
+                        )
+                        self.logger.log(
+                            f"[{colors[split]}]({split})[/{colors[split]}] max_acc: {max_acc:.2f}% at epoch {epoch}"
+                        )
+
+                    #生成准确率的图像
+                    if self.args.save_fig:
+                        import matplotlib
+                        from matplotlib import pyplot as plt
+
+                        matplotlib.use("Agg")
+                        plt.plot(
+                                    [
+                                    metrics.accuracy
+                                    for epoch, metrics in metrics_list
+                                    ],
+                                    label=f"{split}",
+                                )
+                        plt.title(f"{self.algo}_{self.args.dataset}")
+                        plt.ylim(0, 100)
+                        plt.xlabel("Communication Rounds")
+                        plt.ylabel("Accuracy")
+                        plt.legend()
+                        plt.savefig(
+                            OUT_DIR / self.algo / self.output_dir / f"{self.args.dataset}.pdf",
+                            bbox_inches="tight",
+                        )
+
+
+
+
+class FedAvgClient:
+    def __init__(
+        self,
+        model: DecoupledModel,
+        args: Namespace,
+        logger: Logger,
+        device: torch.device,
+    ):
+        self.args = args
+        self.device = device
+        self.client_id: int = None
+
+        #加载数据集和客户端的数据索引
+        try:
+            partition_path = PROJECT_DIR / "data" / self.args.dataset / "partition.pkl"
+            with open(partition_path, "rb") as f:
+                partition = pickle.load(f)
+        except:
+            raise FileNotFoundError(f"Please partition {args.dataset} first.")
+
+        #训练集索引和测试集索引
+        self.data_indices: List[List[int]] = partition["data_indices"]
+
+        #定义数据转换
+        #通过均值和方差对将数据转化为标准正态分布
+        general_data_transform = transforms.Compose(
+            [
+                transforms.Normalize(
+                    DATA_MEAN[self.args.dataset], DATA_STD[self.args.dataset]
+                )
+            ]
+            if self.args.dataset in DATA_MEAN and self.args.dataset in DATA_STD
+            else []
+        )
+        general_target_transform = transforms.Compose([])
+        train_data_transform = transforms.Compose([])
+        train_target_transform = transforms.Compose([])
+
+        self.dataset = DATASETS[self.args.dataset](
+            root=PROJECT_DIR / "data" / args.dataset,
+            args=args.dataset_args,
+            general_data_transform=general_data_transform,
+            general_target_transform=general_target_transform,
+            train_data_transform=train_data_transform,
+            train_target_transform=train_target_transform,
+        )
+
+        self.trainloader: DataLoader = None
+        self.valloader: DataLoader = None
+        self.testloader: DataLoader = None
+        #Subset()可对数据集取子集
+        self.trainset: Subset = Subset(self.dataset, indices=[])
+        self.valset: Subset = Subset(self.dataset, indices=[])
+        self.testset: Subset = Subset(self.dataset, indices=[])
+        self.test_flag = False
+
+        #将模型（model）移动到指定的设备（self.device）上
+        self.model = model.to(self.device)
+        self.local_epoch = self.args.local_epoch
+        #创建了一个交叉熵损失函数（CrossEntropyLoss）的实例，并将其移动到相同的设备（self.device）上
+        self.criterion = torch.nn.CrossEntropyLoss().to(self.device)
+        self.logger = logger
+
+        #opt_state_dict用于存储优化器的状态
+        self.opt_state_dict = {}
+        if self.args.optimizer == "sgd":
+            self.optimizer = torch.optim.SGD(
+                #获得可训练的参数
+                params=trainable_params(self.model),
+                #设置学习率
+                lr=self.args.local_lr,
+                #设置SGD优化器的动量（momentum）。动量是一个帮助加速SGD在相关方向上移动，并抑制振荡的因子
+                momentum=self.args.momentum,
+                #设置权重衰减（weight decay）。权重衰减是一种正则化技术，通过在损失函数中添加权重的L2范数来惩罚大的权重，有助于防止模型过拟合
+                weight_decay=self.args.weight_decay,
+            )
+        elif self.args.optimizer == "adam":
+            self.optimizer = torch.optim.Adam(
+                params=trainable_params(self.model),
+                lr=self.args.local_lr,
+                weight_decay=self.args.weight_decay,
+            )
+        #保存优化器在训练开始时的状态
+        self.init_opt_state_dict = deepcopy(self.optimizer.state_dict())
+
+    #测试功能。仅在FL测试回合中激活。
+    def test(
+        self, client_id: int, new_parameters: OrderedDict[str, torch.Tensor]
+    ) -> Dict[str, Dict[str, Metrics]]:
+        
+        self.test_flag = True
+        self.client_id = client_id
+        self.load_dataset()
+        self.set_parameters(new_parameters)
+
+        results = {"train": Metrics(), "val": Metrics(), "test": Metrics()}
+        results = self.evaluate()
+        self.test_flag = False
+        return results
+
+    #此函数用于加载编号为“self.client_id”的客户端的数据索引。
+    def load_dataset(self):
+        
+        self.trainset.indices = self.data_indices[self.client_id]["train"]
+        self.testset.indices = self.data_indices[self.client_id]["test"]
+        self.valset.indices = self.data_indices[self.client_id]["val"]
+        #DataLoader 可以从给定的数据集中批量加载数据
+        self.trainloader = DataLoader(self.trainset, self.args.batch_size, shuffle=True)
+        self.valloader = DataLoader(self.valset, self.args.batch_size)
+        self.testloader = DataLoader(self.testset, self.args.batch_size)
+
+    #从服务器接收的负载模型参数。
+    def set_parameters(self, new_parameters: OrderedDict[str, torch.Tensor]):
+
+        self.optimizer.load_state_dict(
+            self.opt_state_dict.get(self.client_id, self.init_opt_state_dict)
+        )
+        self.model.load_state_dict(new_parameters, strict=False)
+
+    #评估功能。将在本地训练前后激活。
+    @torch.no_grad()
+    def evaluate(self, model: torch.nn.Module = None) -> Dict[str, Metrics]:
+        
+        # 评估时禁用训练数据转换
+        self.dataset.enable_train_transform = False
+
+        target_model = self.model if model is None else model
+        target_model.eval()
+        train_metrics = Metrics()
+        val_metrics = Metrics()
+        test_metrics = Metrics()
+        criterion = torch.nn.CrossEntropyLoss(reduction="sum")
+
+        if len(self.testset) > 0 and self.args.eval_test:
+            test_metrics = evalutate_model(
+                model=target_model,
+                dataloader=self.testloader,
+                criterion=criterion,
+                device=self.device,
+            )
+
+        if len(self.valset) > 0 and self.args.eval_val:
+            val_metrics = evalutate_model(
+                model=target_model,
+                dataloader=self.valloader,
+                criterion=criterion,
+                device=self.device,
+            )
+
+        if len(self.trainset) > 0 and self.args.eval_train:
+            train_metrics = evalutate_model(
+                model=target_model,
+                dataloader=self.trainloader,
+                criterion=criterion,
+                device=self.device,
+            )
+
+        self.dataset.enable_train_transform = True
+        return {"train": train_metrics, "val": val_metrics, "test": test_metrics}
+
+
+    def train(
+        self,
+        client_id: int,
+        local_epoch: int,
+        new_parameters: OrderedDict[str, torch.Tensor],
+        return_diff=True,
+    ) -> Tuple[Union[OrderedDict[str, torch.Tensor], List[torch.Tensor]], int, Dict]:
+
+        self.client_id = client_id
+        self.local_epoch = local_epoch
+        self.load_dataset()
+        self.set_parameters(new_parameters)
+        #eval_results = self.train_and_log()
+        if self.local_epoch > 0:
+            self.fit()
+            #在本地培训结束时保存优化器的状态
+            self.opt_state_dict[self.client_id] = deepcopy(self.optimizer.state_dict())
+        
+        
+        if return_diff:
+            delta = OrderedDict()
+            for (name, p0), p1 in zip(
+                new_parameters.items(), trainable_params(self.model)
+            ):
+                delta[name] = p0 - p1
+
+            return delta, len(self.trainset)
+        else:
+            return (
+                trainable_params(self.model, detach=True),
+                len(self.trainset),
+            )
+
+    #模型训练
+    def fit(self):
+
+        #将模型设置为训练模式
+        self.model.train()
+        for _ in range(self.local_epoch):
+            for x, y in self.trainloader:
+                #当当前批大小为1时，模型中的batchNorm2d模块将引发错误。
+                #因此，潜在大小为1的数据批被丢弃。
+                if len(x) <= 1:
+                    continue
+
+                x, y = x.to(self.device), y.to(self.device)
+                logit = self.model(x)
+                loss = self.criterion(logit, y)
+                #在反向传播（backpropagation）之前，需要清除之前累积的梯度。这行代码的作用是将优化器self.optimizer中的所有梯度清零
+                self.optimizer.zero_grad()
+                #执行反向传播，计算损失相对于模型参数的梯度
+                loss.backward()
+                #使用存储的梯度来更新模型的参数
+                self.optimizer.step()
+
+
+
+
+def get_fedlc_argparser() -> ArgumentParser:
+    parser = get_fedavg_argparser()
+    parser.add_argument("--tau", type=float, default=1.0)
+    return parser
+
+class FedLCServer(FedAvgServer):
+    def __init__(
+        self,
+        algo: str = "FedLC",
+        args: Namespace = None,
+        default_trainer=False,
+    ):
+        if args is None:
+            args = get_fedlc_argparser().parse_args()
+        super().__init__(algo, args, default_trainer)
+        self.trainer = FedLCClient(deepcopy(self.model), self.args, self.logger, self.device)
+
+
+
+
+class FedLCClient(FedAvgClient):
+    def __init__(self, model, args, logger, device):
+        super().__init__(model, args, logger, device)
+        self.label_distrib = torch.zeros(len(self.dataset.classes), device=self.device)
+
+        def logit_calibrated_loss(logit, y):
+            cal_logit = torch.exp(
+                logit
+                - (
+                    self.args.tau
+                    * torch.pow(self.label_distrib, -1 / 4)
+                    .unsqueeze(0)
+                    .expand((logit.shape[0], -1))
+                )
+            )
+
+            y_logit = torch.gather(cal_logit, dim=-1, index=y.unsqueeze(1))
+            loss = -torch.log(y_logit / cal_logit.sum(dim=-1, keepdim=True))
+            
+            return loss.sum() / logit.shape[0]
+
+        self.criterion = logit_calibrated_loss
+
+    def load_dataset(self):
+        #继承的父类中的load_dataset方法
+        super().load_dataset()
+        #统计每个标签出现的次数。从训练集的索引获取标签，转为列表
+        label_counter = Counter(self.dataset.targets[self.trainset.indices].tolist())
+        #设置为零
+        self.label_distrib.zero_()
+        #遍历label_counter中的每个键值对，cls是标签，count是该标签出现的次数
+        for cls, count in label_counter.items():
+            self.label_distrib[cls] = max(1e-8, count)
+
+
+
+
+PROJECT_DIR = Path(__file__).parent.absolute()
+OUT_DIR = PROJECT_DIR / "out"
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        raise ValueError(
+            "Need to assign a method. Run like `python main.py <method> [args ...]`, e.g., python main.py fedavg -d cifar10 -m lenet5`"
+        )
+
+    #模型名称
+    method = sys.argv[1]
+    #模型参数
+    args_list = sys.argv[2:]
+
+    if method == 'fedavg':
+        parser = get_fedavg_argparser()
+        server = FedAvgServer(args=parser.parse_args(args_list))
+    elif method == 'fedlc':
+        parser = get_fedlc_argparser()
+        server = FedLCServer(args=parser.parse_args(args_list))
+    else:
+        raise ValueError("There is no such model")
+    server.run()

@@ -1,0 +1,532 @@
+import os
+import sys
+import json
+import time
+import random
+import pickle
+import inspect
+import importlib
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import torchvision.models as models
+from torch import Tensor
+
+from pathlib import Path
+from argparse import ArgumentParser, Namespace
+from collections import OrderedDict
+from copy import deepcopy
+from typing import Dict, List, OrderedDict
+
+from functools import partial
+from collections import OrderedDict
+from typing import List, Optional
+from sklearn import metrics
+from html.parser import HTMLParser
+
+from typing import List, Tuple, Union
+from torch.utils.data import Dataset
+from rich.console import Console
+from rich.progress import track
+from torchvision import transforms
+from torch.utils.data import DataLoader, Subset
+from collections import Counter
+
+
+
+class BaseDataset(Dataset):
+    def __init__(self) -> None:
+        self.classes: List = None
+        self.data: torch.Tensor = None
+        self.targets: torch.Tensor = None
+        self.train_data_transform = None
+        self.train_target_transform = None
+        self.general_data_transform = None
+        self.general_target_transform = None
+        self.enable_train_transform = True
+
+    def __getitem__(self, index):
+        #取出对应索引index的数据和标签
+        data, targets = self.data[index], self.targets[index]
+        if self.enable_train_transform and self.train_data_transform is not None:
+            data = self.train_data_transform(data)
+        if self.enable_train_transform and self.train_target_transform is not None:
+            targets = self.train_target_transform(targets)
+        if self.general_data_transform is not None:
+            data = self.general_data_transform(data)
+        if self.general_target_transform is not None:
+            targets = self.general_target_transform(targets)
+        return data, targets
+
+    def __len__(self):
+        return len(self.targets)
+
+
+class CIFAR10(BaseDataset):
+    def __init__(
+        self,
+        root,
+        args=None,
+        general_data_transform=None,
+        general_target_transform=None,
+        train_data_transform=None,
+        train_target_transform=None,
+    ):
+        super().__init__()
+        
+        #root 是一个字符串，表示数据集下载和存储的根目录路径。
+        #第一个参数 True 或 False 用于指定数据集的子集。True 表示加载训练集（train set），False 表示加载测试集（test set）。
+        #download=True 表示如果数据集不在指定的 root 目录下，将会自动从互联网上下载数据集。
+        train_part = torchvision.datasets.CIFAR10(root, True, download=True)
+        test_part = torchvision.datasets.CIFAR10(root, False, download=True)
+
+        #torch.Tensor()数据转换为 PyTorch 张量。permute([0, -1, 1, 2]) 是一个维度重排操作
+        #(batch_size, channels, height, width) 变为(batch_size, height, width, channels)
+        train_data = torch.Tensor(train_part.data).permute([0, -1, 1, 2]).float()
+        test_data = torch.Tensor(test_part.data).permute([0, -1, 1, 2]).float()
+        
+        #在 CIFAR-10 的情况下，标签通常是一个二维张量，其中第一个维度是批处理大小（batch size），第二个维度是单个整数标签。
+        #squeeze() 方法会移除这个大小为 1 的批处理维度，使得标签张量变为一维，每个元素代表一个图像的类别标签。
+        train_targets = torch.Tensor(train_part.targets).long().squeeze()
+        test_targets = torch.Tensor(test_part.targets).long().squeeze()
+        
+        self.data = torch.cat([train_data, test_data])
+        self.targets = torch.cat([train_targets, test_targets])
+        self.classes = train_part.classes
+        self.general_data_transform = general_data_transform
+        self.general_target_transform = general_target_transform
+        self.train_data_transform = train_data_transform
+        self.train_target_transform = train_target_transform
+
+class CIFAR100(BaseDataset):
+    def __init__(
+        self,
+        root,
+        args,
+        general_data_transform=None,
+        general_target_transform=None,
+        train_data_transform=None,
+        train_target_transform=None,
+    ):
+        super().__init__()
+        train_part = torchvision.datasets.CIFAR100(root, True, download=True)
+        test_part = torchvision.datasets.CIFAR100(root, False, download=True)
+        train_data = torch.Tensor(train_part.data).permute([0, -1, 1, 2]).float()
+        test_data = torch.Tensor(test_part.data).permute([0, -1, 1, 2]).float()
+        train_targets = torch.Tensor(train_part.targets).long().squeeze()
+        test_targets = torch.Tensor(test_part.targets).long().squeeze()
+        self.data = torch.cat([train_data, test_data])
+        self.targets = torch.cat([train_targets, test_targets])
+        self.classes = train_part.classes
+        self.general_data_transform = general_data_transform
+        self.general_target_transform = general_target_transform
+        self.train_data_transform = train_data_transform
+        self.train_target_transform = train_target_transform
+        super_class = None
+        if isinstance(args, Namespace):
+            super_class = args.super_class
+        elif isinstance(args, dict):
+            super_class = args["super_class"]
+
+        if super_class:
+            # super_class: [sub_classes]
+            CIFAR100_SUPER_CLASS = {
+                0: ["beaver", "dolphin", "otter", "seal", "whale"],
+                1: ["aquarium_fish", "flatfish", "ray", "shark", "trout"],
+                2: ["orchid", "poppy", "rose", "sunflower", "tulip"],
+                3: ["bottle", "bowl", "can", "cup", "plate"],
+                4: ["apple", "mushroom", "orange", "pear", "sweet_pepper"],
+                5: ["clock", "keyboard", "lamp", "telephone", "television"],
+                6: ["bed", "chair", "couch", "table", "wardrobe"],
+                7: ["bee", "beetle", "butterfly", "caterpillar", "cockroach"],
+                8: ["bear", "leopard", "lion", "tiger", "wolf"],
+                9: ["cloud", "forest", "mountain", "plain", "sea"],
+                10: ["bridge", "castle", "house", "road", "skyscraper"],
+                11: ["camel", "cattle", "chimpanzee", "elephant", "kangaroo"],
+                12: ["fox", "porcupine", "possum", "raccoon", "skunk"],
+                13: ["crab", "lobster", "snail", "spider", "worm"],
+                14: ["baby", "boy", "girl", "man", "woman"],
+                15: ["crocodile", "dinosaur", "lizard", "snake", "turtle"],
+                16: ["hamster", "mouse", "rabbit", "shrew", "squirrel"],
+                17: ["maple_tree", "oak_tree", "palm_tree", "pine_tree", "willow_tree"],
+                18: ["bicycle", "bus", "motorcycle", "pickup_truck", "train"],
+                19: ["lawn_mower", "rocket", "streetcar", "tank", "tractor"],
+            }
+            mapping = {}
+            for super_cls, sub_cls in CIFAR100_SUPER_CLASS.items():
+                for cls in sub_cls:
+                    mapping[cls] = super_cls
+            new_targets = []
+            for cls in self.targets:
+                new_targets.append(mapping[self.classes[cls]])
+            self.targets = torch.tensor(new_targets, dtype=torch.long)
+
+class SVHN(BaseDataset):
+    def __init__(
+        self,
+        root,
+        args=None,
+        general_data_transform=None,
+        general_target_transform=None,
+        train_data_transform=None,
+        train_target_transform=None,
+    ):
+        super().__init__()
+        if not isinstance(root, Path):
+            root = Path(root)
+        train_part = torchvision.datasets.SVHN(root / "raw", "train", download=True)
+        test_part = torchvision.datasets.SVHN(root / "raw", "test", download=True)
+        train_data = torch.Tensor(train_part.data).float()
+        test_data = torch.Tensor(test_part.data).float()
+        train_targets = torch.Tensor(train_part.labels).long()
+        test_targets = torch.Tensor(test_part.labels).long()
+
+        self.data = torch.cat([train_data, test_data])
+        self.targets = torch.cat([train_targets, test_targets])
+        self.classes = list(range(10))
+        self.general_data_transform = general_data_transform
+        self.general_target_transform = general_target_transform
+        self.train_data_transform = train_data_transform
+        self.train_target_transform = train_target_transform
+
+
+DATASETS = {
+    "cifar10": CIFAR10,
+    "cifar100":CIFAR100,
+    "svhn":SVHN,
+}
+
+DATA_MEAN = {
+    "cifar10": [0.4914, 0.4822, 0.4465],
+    "cifar100": [0.5071, 0.4865, 0.4409],
+    "femnist": [0.9637],
+    "svhn": [0.4377, 0.4438, 0.4728],
+}
+
+
+DATA_STD = {
+    "cifar10": [0.2023, 0.1994, 0.201],
+    "cifar100": [0.2009, 0.1984, 0.2023],
+    "femnist": [0.155],
+    "svhn": [0.1201, 0.1231, 0.1052],
+}
+
+
+
+
+class DecoupledModel(nn.Module):
+    def __init__(self):
+        #调用父类nn.Module的初始化函数
+        super(DecoupledModel, self).__init__()
+        self.base: nn.Module = None
+        self.classifier: nn.Module = None
+
+    #检查模型是否可用
+    def check_avaliability(self):
+        if self.base is None or self.classifier is None:
+            raise RuntimeError(
+                "You need to re-write the base and classifier in your custom model class."
+            )
+
+    #前向传播
+    def forward(self, x: Tensor) -> Tensor:
+        return self.classifier(self.base(x))
+
+
+#数据集的输入通道
+INPUT_CHANNELS = {
+    "femnist": 1,
+    "cifar10": 3,
+    "svhn": 3,
+    "cifar100": 3,
+}
+
+#数据集类别数
+NUM_CLASSES = {
+    "svhn": 10,
+    "femnist": 62,
+    "cifar10": 10,
+    "cifar100": 100,
+}
+
+class LeNet5(DecoupledModel):
+    def __init__(self, dataset: str) -> None:
+        super(LeNet5, self).__init__()
+        feature_length = {
+            "femnist": 256,
+            "cifar10": 400,
+            "svhn": 400,
+            "cifar100": 400,
+        }
+        #特征提取部分
+        self.base = nn.Sequential(
+            OrderedDict(
+                conv1=nn.Conv2d(INPUT_CHANNELS[dataset], 6, 5),
+                bn1=nn.BatchNorm2d(6),
+                activation1=nn.ReLU(),
+                pool1=nn.MaxPool2d(2),
+                conv2=nn.Conv2d(6, 16, 5),
+                bn2=nn.BatchNorm2d(16),
+                activation2=nn.ReLU(),
+                pool2=nn.MaxPool2d(2),
+                flatten=nn.Flatten(),
+                fc1=nn.Linear(feature_length[dataset], 120),
+                activation3=nn.ReLU(),
+                fc2=nn.Linear(120, 84),
+            )
+        )
+
+        #最后一个全连接层
+        self.classifier = nn.Linear(84, NUM_CLASSES[dataset])
+
+    def forward(self, x):
+        return self.classifier(F.relu(self.base(x)))
+
+# CNN used in FedAvg
+class FedAvgCNN(DecoupledModel):
+    def __init__(self, dataset: str):
+        super(FedAvgCNN, self).__init__()
+        features_length = {
+            "femnist": 1,
+            "cifar10": 1600,
+            "cifar100": 1600,
+            "svhn": 1600,
+        }
+        self.base = nn.Sequential(
+            OrderedDict(
+                conv1=nn.Conv2d(INPUT_CHANNELS[dataset], 32, 5),
+                activation1=nn.ReLU(),
+                pool1=nn.MaxPool2d(2),
+                conv2=nn.Conv2d(32, 64, 5),
+                activation2=nn.ReLU(),
+                pool2=nn.MaxPool2d(2),
+                flatten=nn.Flatten(),
+                fc1=nn.Linear(features_length[dataset], 512),
+            )
+        )
+        self.classifier = nn.Linear(512, NUM_CLASSES[dataset])
+
+    def forward(self, x):
+        return self.classifier(F.relu(self.base(x)))
+
+class AlexNet(DecoupledModel):
+    def __init__(self, dataset):
+        super().__init__()
+
+        #注意：如果不希望对参数进行预训练，请将“预训练”设置为False
+        pretrained = True
+        alexnet = models.alexnet(
+            #加载预训练权重
+            weights=models.AlexNet_Weights.DEFAULT if pretrained else None
+        )
+        self.base = alexnet
+        self.classifier = nn.Linear(
+            #获取了AlexNet原始分类器最后一层的输入特征数
+            alexnet.classifier[-1].in_features, NUM_CLASSES[dataset]
+        )
+        #nn.Identity()是返回其输入
+        self.base.classifier[-1] = nn.Identity()
+
+MODELS = {
+    "lenet5": LeNet5,
+    "avgcnn": FedAvgCNN,
+    "alex": AlexNet,
+}
+
+
+
+
+#转换为NumPy数组
+def to_numpy(x):
+    if isinstance(x, torch.Tensor):
+        return x.cpu().numpy()
+    elif isinstance(x, list):
+        return np.array(x)
+    else:
+        raise TypeError(
+            f"input data should be torch.Tensor or built-in list. Now {type(x)}"
+        )
+
+
+class Metrics:
+    def __init__(self, loss=None, predicts=None, targets=None):
+        self._loss = loss if loss is not None else 0.0
+        self._targets = targets if targets is not None else []
+        self._predicts = predicts if predicts is not None else []
+
+    #更新损失，预测值
+    def update(self, other):
+        if other is not None:
+            self._predicts.extend(to_numpy(other._predicts))
+            self._targets.extend(to_numpy(other._targets))
+            self._loss += other._loss
+
+    def _calculate(self, metric, **kwargs):
+        #利用传入的metric函数来计算self._targets（真实值）和self._predicts（预测值）之间的某种指标
+        return metric(self._targets, self._predicts, **kwargs)
+
+    @property
+    def loss(self):
+        try:
+            loss = self._loss / len(self._targets)
+        except ZeroDivisionError:
+            return 0
+        return loss
+
+    @property
+    def accuracy(self):
+        if self.size == 0:
+            return 0
+        score = self._calculate(metrics.accuracy_score)
+        return score * 100
+    """
+    @property
+    def corrects(self):
+        return self._calculate(metrics.accuracy_score, normalize=False)
+    """
+    @property
+    def size(self):
+        return len(self._targets)
+
+
+
+
+def fix_random_seed(seed: int) -> None:
+    """修复FL训练的随机种子。
+
+    Args：
+    seed（int）：您喜欢的任意数字作为随机种子。
+    """
+    #设置Python的哈希随机种子
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    #random 模块用于生成伪随机数
+    random.seed(seed)
+    #设置NumPy库的随机数生成器的种子
+    np.random.seed(seed)
+    #设置PyTorch库的随机数生成器的种子
+    torch.random.manual_seed(seed)
+    if torch.cuda.is_available():
+        #清除PyTorch的CUDA缓存
+        torch.cuda.empty_cache()
+        #设置所有CUDA随机数生成器的种子，确保在GPU上生成的随机数也是可复现的
+        torch.cuda.manual_seed_all(seed)
+    #设置cudnn为确定性模式。当这个标志被设置为True时，CuDNN的卷积操作将使用确定的算法，这意味着给定相同的输入和权重，卷积操作将总是产生相同的结果
+    torch.backends.cudnn.deterministic = True
+    #当这个标志被设置为False时，CuDNN会禁用自动调整卷积算法以寻找最快算法的功能
+    torch.backends.cudnn.benchmark = False
+
+#动态选择CUDA设备（内存最多）运行FL实验。torch.device:所选的CUDA设备。
+def get_optimal_cuda_device(use_cuda: bool) -> torch.device:
+    if not torch.cuda.is_available() or not use_cuda:
+        return torch.device("cpu")
+    #调用pynvml库中的nvmlInit函数,提供了监控和管理NVIDIA GPU状态的接口
+    pynvml.nvmlInit()
+    gpu_memory = []
+    if "CUDA_VISIBLE_DEVICES" in os.environ.keys():
+        #如果CUDA_VISIBLE_DEVICES存在，这行代码会将其值按逗号分割，并将每个分割出来的字符串转换为整数，然后将这些整数存储在列表gpu_ids中
+        gpu_ids = [int(i) for i in os.environ["CUDA_VISIBLE_DEVICES"].split(",")]
+        #使用assert语句来确保gpu_ids列表中的最大设备ID小于PyTorch可以检测到的CUDA设备总数
+        assert max(gpu_ids) < torch.cuda.device_count()
+    else:
+        #使用range函数创建一个包含所有可用CUDA设备ID的列表
+        gpu_ids = range(torch.cuda.device_count())
+
+    for i in gpu_ids:
+        #获取对应设备ID的NVML设备句柄
+        handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+        #获取该GPU设备的内存信息
+        memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        #memory_info中提取free字段，这个字段表示GPU设备上当前的空闲内存量
+        gpu_memory.append(memory_info.free)
+    #转换成一个NumPy数组
+    gpu_memory = np.array(gpu_memory)
+    #使用np.argmax()函数找到gpu_memory数组中最大值的索引
+    best_gpu_id = np.argmax(gpu_memory)
+    return torch.device(f"cuda:{best_gpu_id}")
+
+#将`src`中`.requires_grad=True`的所有参数收集到列表中并返回。返回：参数列表[，参数名称]。
+def trainable_params(
+    src: Union[OrderedDict[str, torch.Tensor], torch.nn.Module],
+    detach=False,
+    requires_name=False,
+) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], List[str]]]:
+
+    #detach()分离计算图，clone()深度复制
+    func = (lambda x: x.detach().clone()) if detach else (lambda x: x)
+    parameters = []
+    keys = []
+    #isinstance() 函数来判断一个对象是否是一个已知的类型
+    if isinstance(src, OrderedDict):
+        for name, param in src.items():
+            if param.requires_grad:
+                #如果param需要梯度，那么它将param传递给之前定义的func函数（该函数可能会从计算图中分离并克隆张量），并将结果添加到parameters列表中
+                parameters.append(func(param))
+                keys.append(name)
+    elif isinstance(src, torch.nn.Module):
+        #使用state_dict(keep_vars=True)方法获取模型的参数。这个方法返回一个有序字典（OrderedDict），其中包含了模型的参数
+        for name, param in src.state_dict(keep_vars=True).items():
+            if param.requires_grad:
+                parameters.append(func(param))
+                keys.append(name)
+
+    if requires_name:
+        return parameters, keys
+    else:
+        return parameters
+
+#根据enable_log参数的值，决定是否启用日志，并将日志输出到控制台或指定的文件。如果启用了日志，它会创建一个Console对象来负责日志的输出，并设置相应的输出选项
+class Logger:
+    def __init__(
+        self, stdout: Console, enable_log: bool, logfile_path: Union[Path, str]
+    ):
+        """此类用于解决库`rich`中进度条和日志函数之间的不兼容问题。
+        Args：
+        stdout（控制台）：`rich.Console。控制台`用于将信息打印到标准输出。
+        enable_log（bool）：标志表示日志函数是否处于活动状态。
+        logfile_path（Union[path，str]）：日志文件的路径。
+        """
+
+        self.stdout = stdout
+        self.logfile_stream = None
+        self.enable_log = enable_log
+        if self.enable_log:
+            self.logfile_stream = open(logfile_path, "w")
+            #Console控制台对象
+            self.logger = Console(
+                file=self.logfile_stream, record=True, log_path=False, log_time=False
+            )
+
+    def log(self, *args, **kwargs):
+        self.stdout.log(*args, **kwargs)
+        if self.enable_log:
+            #所有传递给self.log方法的参数（*args和**kwargs）也会被传递给self.logger.log方法
+            self.logger.log(*args, **kwargs)
+
+    #关闭类实例中与日志文件相关的流
+    def close(self):
+        if self.logfile_stream:
+            self.logfile_stream.close()
+
+@torch.no_grad()
+def evalutate_model(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    criterion=torch.nn.CrossEntropyLoss(reduction="sum"),
+    device=torch.device("cpu"),
+) -> Metrics:
+
+    model.eval()
+    metrics = Metrics()
+    for x, y in dataloader:
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
+        loss = criterion(logits, y).item()
+        pred = torch.argmax(logits, -1)
+        metrics.update(Metrics(loss, pred, y))
+    return metrics
+
+
+

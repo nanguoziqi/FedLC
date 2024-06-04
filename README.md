@@ -1,5 +1,5 @@
 # FedLC
-本项目使用Pytorch实现联邦学习FedAvg算法和FedLC算法。详细代码在main文件中。
+本项目使用Pytorch实现联邦学习FedAvg算法和FedLC算法。详细代码在main.py文件中。
 # 运行环境
 torch=2.1.2  
 rich=13.3.5  
